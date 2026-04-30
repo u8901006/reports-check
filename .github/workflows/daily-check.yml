@@ -7,10 +7,19 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -29,9 +38,9 @@ jobs:
           GLM_MODEL: ${{ vars.GLM_MODEL }}
           HUB_URL: ${{ vars.HUB_URL }}
 
-      - uses: peaceiris/actions-gh-pages@4b09552702d0b65573696410d4707c765da2630b # v4.0.0
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479577c7f40049030e # v5.0.0
+      - uses: actions/upload-pages-artifact@56afc609e7430d0216b4e4f73b28b95b157b1c0e # v3.0.1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./
-          publish_branch: gh-pages
-          force_orphan: true
+          path: "."
+      - id: deployment
+        uses: actions/deploy-pages@d6db90d64ac5ed9a9ddc04ea610a1e259d4e17b4 # v4.0.5

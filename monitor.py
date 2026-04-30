@@ -1,9 +1,10 @@
 import os
 import re
 import json
-import hashlib
+import time
 import logging
 from datetime import datetime, timezone, timedelta
+from html import escape
 from pathlib import Path
 
 import requests
@@ -24,6 +25,8 @@ GLM_MODEL = os.environ.get("GLM_MODEL", "glm-4.7-flash")
 TZ = timezone(timedelta(hours=8))
 HISTORY_DIR = Path("history")
 REPORTS_JSON = Path("reports_status.json")
+API_DELAY = float(os.environ.get("API_DELAY", "5"))
+MAX_RETRIES = 3
 
 
 def fetch_page(url: str, timeout: int = 30) -> str:
@@ -60,9 +63,47 @@ def extract_report_links(hub_html: str) -> list[dict]:
     return reports
 
 
+def call_glm_api(payload: dict) -> dict:
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
+                f"{GLM_API_BASE}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {GLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                wait = API_DELAY * (attempt + 2)
+                log.warning("Rate limited (429), waiting %.0fs before retry %d/%d", wait, attempt + 1, MAX_RETRIES)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data["choices"][0]["message"]["content"].strip()
+            raw = re.sub(r"^```json\s*|^```\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            return json.loads(raw)
+        except (json.JSONDecodeError, KeyError) as e:
+            log.error("Parse error on attempt %d: %s — raw: %s", attempt + 1, e, resp.text[:200] if 'resp' in dir() else "no response")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(API_DELAY * (attempt + 1))
+            continue
+        except requests.exceptions.RequestException as e:
+            log.error("Request error on attempt %d: %s", attempt + 1, e)
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(API_DELAY * (attempt + 1))
+            continue
+    raise RuntimeError(f"All {MAX_RETRIES} API attempts failed")
+
+
 def analyze_report_with_ai(report_url: str, content: str) -> dict:
     if len(content) > 12000:
         content = content[:12000]
+
+    safe_url = report_url[:200]
 
     payload = {
         "model": GLM_MODEL,
@@ -82,7 +123,7 @@ def analyze_report_with_ai(report_url: str, content: str) -> dict:
             },
             {
                 "role": "user",
-                "content": f"URL: {report_url}\n\n---\n\n{content}",
+                "content": f"URL: {safe_url}\n\n---\n\n{content}",
             },
         ],
         "temperature": 0.1,
@@ -90,20 +131,7 @@ def analyze_report_with_ai(report_url: str, content: str) -> dict:
     }
 
     try:
-        resp = requests.post(
-            f"{GLM_API_BASE}/chat/completions",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {GLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        raw = re.sub(r"^```json\s*|^```\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        return json.loads(raw)
+        return call_glm_api(payload)
     except Exception as e:
         log.error("AI analysis failed for %s: %s", report_url, e)
         return {
@@ -133,7 +161,6 @@ def check_single_report(report: dict) -> dict:
             "summary": f"抓取失敗: {e}",
             "issues": [str(e)],
         }
-        text = ""
 
     status = "pass" if ai_result.get("has_research_data") and ai_result.get("is_updated_today") else "fail"
     if not ai_result.get("has_research_data"):
@@ -199,27 +226,34 @@ def generate_html(results: list[dict], history: list[list[dict]]) -> str:
     rows_html = ""
     for r in results:
         icon = {"pass": "✅", "stale": "⚠️", "no_data": "📭", "fail": "❌"}.get(r["status"], "❓")
-        theme_badge = r.get("theme", "")
+        theme_badge = escape(r.get("theme", ""))
+        name = escape(r.get("name", ""))
+        summary = escape(r.get("summary", ""))
+        update_date = escape(str(r.get("update_date", "N/A")))
+        checked_at = escape(r.get("checked_at", ""))
+        url = escape(r.get("url", "#"))
         rows_html += f"""
         <tr class="status-{r['status']}">
           <td>{icon}</td>
-          <td><a href="{r['url']}" target="_blank">{r['name']}</a></td>
+          <td><a href="{url}" target="_blank">{name}</a></td>
           <td>{theme_badge}</td>
-          <td>{r.get('update_date', 'N/A')}</td>
+          <td>{update_date}</td>
           <td>{r.get('research_count', 0)}</td>
-          <td>{r.get('summary', '')}</td>
-          <td>{r.get('checked_at', '')}</td>
+          <td>{summary}</td>
+          <td>{checked_at}</td>
         </tr>"""
 
     history_rows = ""
     for date_str, score in zip(history_dates, history_scores):
         color = "#22c55e" if score >= 80 else "#eab308" if score >= 50 else "#ef4444"
-        history_rows += f'<tr><td>{date_str}</td><td style="color:{color};font-weight:bold">{score}%</td></tr>'
+        history_rows += f'<tr><td>{escape(date_str)}</td><td style="color:{color};font-weight:bold">{score}%</td></tr>'
 
     theme_summary = ""
     for t, reps in themes.items():
         t_pass = sum(1 for r in reps if r["status"] == "pass")
-        theme_summary += f'<div class="theme-card"><h3>{t}</h3><p>{t_pass}/{len(reps)} 通過</p></div>'
+        theme_summary += f'<div class="theme-card"><h3>{escape(t)}</h3><p>{t_pass}/{len(reps)} 通過</p></div>'
+
+    health_color = "var(--green)" if health_pct >= 80 else "var(--yellow)" if health_pct >= 50 else "var(--red)"
 
     return f"""<!DOCTYPE html>
 <html lang="zh-TW">
@@ -237,7 +271,7 @@ h1 {{ text-align: center; margin: 1rem 0; font-size: 1.5rem; }}
 .card {{ background: var(--card); border-radius: 12px; padding: 1.2rem; text-align: center; }}
 .card .num {{ font-size: 2.2rem; font-weight: 700; }}
 .card .label {{ font-size: 0.85rem; color: #94a3b8; margin-top: 0.3rem; }}
-.health {{ color: {'var(--green)' if health_pct >= 80 else 'var(--yellow)' if health_pct >= 50 else 'var(--red)'}; }}
+.health {{ color: {health_color}; }}
 .themes {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 0.8rem; margin-bottom: 2rem; }}
 .theme-card {{ background: var(--card); border-radius: 8px; padding: 0.8rem 1rem; }}
 .theme-card h3 {{ font-size: 0.95rem; color: var(--blue); }}
@@ -260,7 +294,7 @@ footer {{ text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.75r
 </head>
 <body>
 <h1>精神醫學文獻日報監控儀表板</h1>
-<p class="meta">最後檢查時間：{now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+8) ｜ 來源：<a href="{HUB_URL}" target="_blank">{HUB_URL}</a></p>
+<p class="meta">最後檢查時間：{now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+8) ｜ 來源：<a href="{escape(HUB_URL)}" target="_blank">{escape(HUB_URL)}</a></p>
 
 <div class="grid">
   <div class="card"><div class="num">{total}</div><div class="label">總報表數</div></div>
@@ -311,6 +345,8 @@ def main():
         results.append(result)
         log.info("  -> status=%s research_count=%s update=%s",
                  result["status"], result.get("research_count"), result.get("update_date"))
+        if i < len(reports):
+            time.sleep(API_DELAY)
 
     with open(REPORTS_JSON, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
