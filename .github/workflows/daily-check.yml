@@ -29,7 +29,7 @@ jobs:
           GLM_MODEL: ${{ vars.GLM_MODEL }}
           HUB_URL: ${{ vars.HUB_URL }}
 
-      - uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d1c6692e07e894262 # v4.0.0
+      - uses: peaceiris/actions-gh-pages@4b09552702d0b65573696410d4707c765da2630b # v4.0.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./
