@@ -38,9 +38,9 @@ jobs:
           GLM_MODEL: ${{ vars.GLM_MODEL }}
           HUB_URL: ${{ vars.HUB_URL }}
 
-      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479577c7f40049030e # v5.0.0
-      - uses: actions/upload-pages-artifact@56afc609e7430d0216b4e4f73b28b95b157b1c0e # v3.0.1
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: "."
       - id: deployment
-        uses: actions/deploy-pages@d6db90d64ac5ed9a9ddc04ea610a1e259d4e17b4 # v4.0.5
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
