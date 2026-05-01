@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from html import escape
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,6 +28,8 @@ HISTORY_DIR = Path("history")
 REPORTS_JSON = Path("reports_status.json")
 API_DELAY = float(os.environ.get("API_DELAY", "5"))
 MAX_RETRIES = 3
+YESTERDAY = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+YESTERDAY_SLUG = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def fetch_page(url: str, timeout: int = 30) -> str:
@@ -63,6 +66,16 @@ def extract_report_links(hub_html: str) -> list[dict]:
     return reports
 
 
+def find_yesterday_report_url(index_url: str, index_html: str) -> str | None:
+    soup = BeautifulSoup(index_html, "html.parser")
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"].strip()
+        text = a_tag.get_text(strip=True)
+        if YESTERDAY_SLUG in href or YESTERDAY_SLUG.replace("-", "/") in text:
+            return urljoin(index_url + "/", href)
+    return None
+
+
 def call_glm_api(payload: dict) -> dict:
     for attempt in range(MAX_RETRIES):
         try:
@@ -87,7 +100,8 @@ def call_glm_api(payload: dict) -> dict:
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
         except (json.JSONDecodeError, KeyError) as e:
-            log.error("Parse error on attempt %d: %s — raw: %s", attempt + 1, e, resp.text[:200] if 'resp' in dir() else "no response")
+            resp_text = resp.text[:200] if "resp" in dir() else "no response"
+            log.error("Parse error on attempt %d: %s — raw: %s", attempt + 1, e, resp_text)
             if attempt < MAX_RETRIES - 1:
                 time.sleep(API_DELAY * (attempt + 1))
             continue
@@ -99,7 +113,7 @@ def call_glm_api(payload: dict) -> dict:
     raise RuntimeError(f"All {MAX_RETRIES} API attempts failed")
 
 
-def analyze_report_with_ai(report_url: str, content: str) -> dict:
+def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> dict:
     if len(content) > 12000:
         content = content[:12000]
 
@@ -111,10 +125,12 @@ def analyze_report_with_ai(report_url: str, content: str) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "你是一個精神醫學文獻日報品質檢查員。請分析以下日報網頁內容，並以 JSON 回答：\n"
-                    "1. \"has_research_data\": boolean - 是否包含研究文獻資料（論文標題、摘要、DOI等）\n"
-                    "2. \"is_updated_today\": boolean - 內容中的日期是否為今天或最近的日期\n"
-                    "3. \"update_date\": string - 內容中顯示的更新日期（格式 YYYY-MM-DD），若無則 null\n"
+                    "你是一個精神醫學文獻日報品質檢查員。請分析以下日報網頁內容，判斷日報是否正常更新。\n"
+                    f"今天檢查的目標日期是：{target_date}（前一天）\n\n"
+                    "請以 JSON 回答：\n"
+                    "1. \"has_research_data\": boolean - 是否包含研究文獻資料（論文標題、摘要、DOI 等）\n"
+                    f"2. \"is_updated_on_target_date\": boolean - 此日報是否為 {target_date} 的日報（日期相符）\n"
+                    "3. \"update_date\": string - 內容中顯示的日報日期（格式 YYYY-MM-DD），若無則 null\n"
                     "4. \"research_count\": integer - 識別出的研究文獻數量\n"
                     "5. \"summary\": string - 一句話描述此日報的狀態（繁體中文）\n"
                     "6. \"issues\": array of strings - 發現的問題列表（如無問題則空陣列）\n"
@@ -136,7 +152,7 @@ def analyze_report_with_ai(report_url: str, content: str) -> dict:
         log.error("AI analysis failed for %s: %s", report_url, e)
         return {
             "has_research_data": False,
-            "is_updated_today": False,
+            "is_updated_on_target_date": False,
             "update_date": None,
             "research_count": 0,
             "summary": f"AI 分析失敗: {e}",
@@ -145,33 +161,87 @@ def analyze_report_with_ai(report_url: str, content: str) -> dict:
 
 
 def check_single_report(report: dict) -> dict:
-    url = report["url"]
+    index_url = report["url"].rstrip("/")
+    yesterday_url = None
+    ai_result = {}
+
     try:
-        html = fetch_page(url)
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator="\n", strip=True)
-        ai_result = analyze_report_with_ai(url, text)
+        index_html = fetch_page(index_url)
+        yesterday_url = find_yesterday_report_url(index_url, index_html)
     except Exception as e:
-        log.error("Failed to fetch %s: %s", url, e)
+        log.error("Failed to fetch index %s: %s", index_url, e)
         ai_result = {
             "has_research_data": False,
-            "is_updated_today": False,
+            "is_updated_on_target_date": False,
             "update_date": None,
             "research_count": 0,
-            "summary": f"抓取失敗: {e}",
+            "summary": f"首頁抓取失敗: {e}",
+            "issues": [str(e)],
+        }
+        return {
+            "name": report["name"],
+            "theme": report["theme"],
+            "url": index_url,
+            "yesterday_url": None,
+            "status": "fail",
+            "checked_at": datetime.now(TZ).isoformat(),
+            **ai_result,
+        }
+
+    if not yesterday_url:
+        log.warning("No yesterday (%s) report found on %s", YESTERDAY, index_url)
+        ai_result = {
+            "has_research_data": False,
+            "is_updated_on_target_date": False,
+            "update_date": None,
+            "research_count": 0,
+            "summary": f"找不到 {YESTERDAY} 的日報",
+            "issues": [f"首頁未列出 {YESTERDAY} 的日報連結"],
+        }
+        return {
+            "name": report["name"],
+            "theme": report["theme"],
+            "url": index_url,
+            "yesterday_url": None,
+            "status": "missing",
+            "checked_at": datetime.now(TZ).isoformat(),
+            **ai_result,
+        }
+
+    log.info("  Found yesterday report: %s", yesterday_url)
+    try:
+        report_html = fetch_page(yesterday_url)
+        soup = BeautifulSoup(report_html, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
+        ai_result = analyze_report_with_ai(yesterday_url, text, YESTERDAY)
+    except Exception as e:
+        log.error("Failed to fetch yesterday report %s: %s", yesterday_url, e)
+        ai_result = {
+            "has_research_data": False,
+            "is_updated_on_target_date": False,
+            "update_date": None,
+            "research_count": 0,
+            "summary": f"昨日日報抓取失敗: {e}",
             "issues": [str(e)],
         }
 
-    status = "pass" if ai_result.get("has_research_data") and ai_result.get("is_updated_today") else "fail"
-    if not ai_result.get("has_research_data"):
+    has_data = ai_result.get("has_research_data", False)
+    is_on_date = ai_result.get("is_updated_on_target_date", False)
+
+    if has_data and is_on_date:
+        status = "pass"
+    elif has_data and not is_on_date:
+        status = "wrong_date"
+    elif not has_data and is_on_date:
         status = "no_data"
-    elif not ai_result.get("is_updated_today"):
-        status = "stale"
+    else:
+        status = "fail"
 
     return {
         "name": report["name"],
         "theme": report["theme"],
-        "url": url,
+        "url": index_url,
+        "yesterday_url": yesterday_url,
         "status": status,
         "checked_at": datetime.now(TZ).isoformat(),
         **ai_result,
@@ -198,13 +268,32 @@ def load_history(days: int = 7) -> list[list[dict]]:
     return history
 
 
+STATUS_ICONS = {
+    "pass": "✅",
+    "wrong_date": "⚠️",
+    "no_data": "📭",
+    "missing": "🚫",
+    "fail": "❌",
+}
+
+STATUS_LABELS = {
+    "pass": "正常",
+    "wrong_date": "日期不符",
+    "no_data": "無研究資料",
+    "missing": "缺少日報",
+    "fail": "異常",
+}
+
+
 def generate_html(results: list[dict], history: list[list[dict]]) -> str:
     now = datetime.now(TZ)
     total = len(results)
     passed = sum(1 for r in results if r["status"] == "pass")
-    stale = sum(1 for r in results if r["status"] == "stale")
+    wrong_date = sum(1 for r in results if r["status"] == "wrong_date")
     no_data = sum(1 for r in results if r["status"] == "no_data")
+    missing = sum(1 for r in results if r["status"] == "missing")
     failed = sum(1 for r in results if r["status"] == "fail")
+    unhealthy = wrong_date + no_data + missing + failed
     health_pct = round((passed / total * 100) if total else 0, 1)
 
     history_dates = []
@@ -225,17 +314,20 @@ def generate_html(results: list[dict], history: list[list[dict]]) -> str:
 
     rows_html = ""
     for r in results:
-        icon = {"pass": "✅", "stale": "⚠️", "no_data": "📭", "fail": "❌"}.get(r["status"], "❓")
-        theme_badge = escape(r.get("theme", ""))
+        icon = STATUS_ICONS.get(r["status"], "❓")
+        label = STATUS_LABELS.get(r["status"], "未知")
         name = escape(r.get("name", ""))
         summary = escape(r.get("summary", ""))
         update_date = escape(str(r.get("update_date", "N/A")))
         checked_at = escape(r.get("checked_at", ""))
-        url = escape(r.get("url", "#"))
+        y_url = escape(r.get("yesterday_url", "")) if r.get("yesterday_url") else ""
+        index_url = escape(r.get("url", "#"))
+        theme_badge = escape(r.get("theme", ""))
+        report_link = f'<a href="{y_url}" target="_blank">{name}</a>' if y_url else f'<a href="{index_url}" target="_blank">{name}</a>'
         rows_html += f"""
         <tr class="status-{r['status']}">
-          <td>{icon}</td>
-          <td><a href="{url}" target="_blank">{name}</a></td>
+          <td>{icon} {label}</td>
+          <td>{report_link}</td>
           <td>{theme_badge}</td>
           <td>{update_date}</td>
           <td>{r.get('research_count', 0)}</td>
@@ -262,12 +354,13 @@ def generate_html(results: list[dict], history: list[list[dict]]) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>精神醫學文獻日報監控儀表板</title>
 <style>
-:root {{ --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6; }}
+:root {{ --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6; --orange: #f97316; }}
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ font-family: -apple-system, 'Noto Sans TC', sans-serif; background: var(--bg); color: var(--text); padding: 1rem; }}
 h1 {{ text-align: center; margin: 1rem 0; font-size: 1.5rem; }}
 .meta {{ text-align: center; color: #94a3b8; margin-bottom: 1.5rem; font-size: 0.85rem; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
+.target-date {{ color: var(--orange); font-weight: 600; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-bottom: 2rem; }}
 .card {{ background: var(--card); border-radius: 12px; padding: 1.2rem; text-align: center; }}
 .card .num {{ font-size: 2.2rem; font-weight: 700; }}
 .card .label {{ font-size: 0.85rem; color: #94a3b8; margin-top: 0.3rem; }}
@@ -281,34 +374,47 @@ th {{ background: #334155; padding: 0.7rem 0.5rem; text-align: left; font-size: 
 td {{ padding: 0.6rem 0.5rem; border-top: 1px solid #334155; font-size: 0.82rem; }}
 tr:hover {{ background: #2d3a4f; }}
 .status-pass td:nth-child(1) {{ color: var(--green); }}
-.status-stale td:nth-child(1) {{ color: var(--yellow); }}
+.status-wrong_date td:nth-child(1) {{ color: var(--orange); }}
 .status-no_data td:nth-child(1) {{ color: var(--red); }}
+.status-missing td:nth-child(1) {{ color: var(--red); }}
 .status-fail td:nth-child(1) {{ color: var(--red); }}
 a {{ color: var(--blue); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
 .history {{ margin-top: 2rem; }}
 .history table {{ max-width: 400px; }}
+.legend {{ margin-bottom: 1rem; padding: 0.8rem 1rem; background: var(--card); border-radius: 8px; font-size: 0.8rem; color: #94a3b8; }}
+.legend span {{ margin-right: 1rem; }}
 footer {{ text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.75rem; }}
 @media (max-width: 768px) {{ .grid {{ grid-template-columns: repeat(2, 1fr); }} }}
 </style>
 </head>
 <body>
 <h1>精神醫學文獻日報監控儀表板</h1>
-<p class="meta">最後檢查時間：{now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+8) ｜ 來源：<a href="{escape(HUB_URL)}" target="_blank">{escape(HUB_URL)}</a></p>
+<p class="meta">檢查目標：<span class="target-date">{YESTERDAY}</span>（前一天日報）｜ 檢查時間：{now.strftime('%Y-%m-%d %H:%M:%S')} (UTC+8)｜ 來源：<a href="{escape(HUB_URL)}" target="_blank">李政洋身心診所</a></p>
+
+<div class="legend">
+  <span>✅ 正常 — 日報存在、日期正確、有研究資料</span>
+  <span>⚠️ 日期不符 — 有內容但日期非前一天</span>
+  <span>📭 無研究資料 — 日報存在但缺少文獻</span>
+  <span>🚫 缺少日報 — 前一天日報連結不存在</span>
+  <span>❌ 異常 — 抓取或分析失敗</span>
+</div>
 
 <div class="grid">
   <div class="card"><div class="num">{total}</div><div class="label">總報表數</div></div>
   <div class="card"><div class="num health">{health_pct}%</div><div class="label">健康度</div></div>
-  <div class="card"><div class="num" style="color:var(--green)">{passed}</div><div class="label">正常更新</div></div>
-  <div class="card"><div class="num" style="color:var(--yellow)">{stale}</div><div class="label">未更新</div></div>
-  <div class="card"><div class="num" style="color:var(--red)">{no_data + failed}</div><div class="label">無資料/異常</div></div>
+  <div class="card"><div class="num" style="color:var(--green)">{passed}</div><div class="label">✅ 正常</div></div>
+  <div class="card"><div class="num" style="color:var(--orange)">{wrong_date}</div><div class="label">⚠️ 日期不符</div></div>
+  <div class="card"><div class="num" style="color:var(--red)">{no_data}</div><div class="label">📭 無研究資料</div></div>
+  <div class="card"><div class="num" style="color:var(--red)">{missing}</div><div class="label">🚫 缺少日報</div></div>
+  <div class="card"><div class="num" style="color:var(--red)">{failed}</div><div class="label">❌ 異常</div></div>
 </div>
 
 <div class="themes">{theme_summary}</div>
 
 <table>
   <thead>
-    <tr><th>狀態</th><th>報表名稱</th><th>主題</th><th>更新日期</th><th>文獻數</th><th>AI 分析摘要</th><th>檢查時間</th></tr>
+    <tr><th>狀態</th><th>報表名稱</th><th>主題</th><th>日報日期</th><th>文獻數</th><th>AI 分析摘要</th><th>檢查時間</th></tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
@@ -321,13 +427,14 @@ footer {{ text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.75r
   </table>
 </div>
 
-<footer>Reports Check Monitor · GitHub Actions · GLM-4.7-Flash</footer>
+<footer>Reports Check Monitor · GitHub Actions · GLM-4.7-Flash · 檢查前一天日報狀態</footer>
 </body>
 </html>"""
 
 
 def main():
     log.info("=== Starting daily report check ===")
+    log.info("Target date (yesterday): %s", YESTERDAY)
 
     log.info("Fetching hub page: %s", HUB_URL)
     hub_html = fetch_page(HUB_URL)
@@ -343,8 +450,9 @@ def main():
         log.info("[%d/%d] Checking: %s", i, len(reports), report["name"])
         result = check_single_report(report)
         results.append(result)
-        log.info("  -> status=%s research_count=%s update=%s",
-                 result["status"], result.get("research_count"), result.get("update_date"))
+        log.info("  -> status=%s research_count=%s update=%s yesterday_url=%s",
+                 result["status"], result.get("research_count"),
+                 result.get("update_date"), result.get("yesterday_url"))
         if i < len(reports):
             time.sleep(API_DELAY)
 
