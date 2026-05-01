@@ -97,12 +97,18 @@ def call_glm_api(payload: dict) -> dict:
                 continue
             resp.raise_for_status()
             data = resp.json()
-            raw = data["choices"][0]["message"]["content"].strip()
+            finish_reason = data.get("choices", [{}])[0].get("finish_reason", "")
+            raw = data["choices"][0]["message"].get("content", "").strip()
+            if not raw or finish_reason == "length":
+                log.warning("Empty or truncated response (finish_reason=%s), retrying", finish_reason)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(API_DELAY * (attempt + 1))
+                continue
             raw = re.sub(r"^```json\s*|^```\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             return json.loads(raw)
         except (json.JSONDecodeError, KeyError) as e:
-            resp_text = resp.text[:200] if "resp" in dir() else "no response"
+            resp_text = resp.text[:200] if resp else "no response"
             log.error("Parse error on attempt %d: %s — raw: %s", attempt + 1, e, resp_text)
             if attempt < MAX_RETRIES - 1:
                 time.sleep(API_DELAY * (attempt + 1))
@@ -116,8 +122,8 @@ def call_glm_api(payload: dict) -> dict:
 
 
 def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> dict:
-    if len(content) > 12000:
-        content = content[:12000]
+    if len(content) > 6000:
+        content = content[:6000]
 
     safe_url = report_url[:200]
 
@@ -127,25 +133,27 @@ def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> d
             {
                 "role": "system",
                 "content": (
-                    "你是一個精神醫學文獻日報品質檢查員。請分析以下日報網頁內容，判斷日報是否正常更新。\n"
-                    f"今天檢查的目標日期是：{target_date}（前一天）\n\n"
-                    "請以 JSON 回答：\n"
-                    "1. \"has_research_data\": boolean - 是否包含研究文獻資料（論文標題、摘要、DOI 等）\n"
-                    f"2. \"is_updated_on_target_date\": boolean - 此日報是否為 {target_date} 的日報（日期相符）\n"
-                    "3. \"update_date\": string - 內容中顯示的日報日期（格式 YYYY-MM-DD），若無則 null\n"
-                    "4. \"research_count\": integer - 識別出的研究文獻數量\n"
-                    "5. \"summary\": string - 一句話描述此日報的狀態（繁體中文）\n"
-                    "6. \"issues\": array of strings - 發現的問題列表（如無問題則空陣列）\n"
-                    "只回傳 JSON，不要其他文字。"
+                    "你是日報品質檢查員。直接輸出 JSON，不要思考過程、不要解釋。\n"
+                    f"目標日期：{target_date}\n\n"
+                    "JSON 格式：\n"
+                    "{\"has_research_data\": bool, \"is_updated_on_target_date\": bool, "
+                    "\"update_date\": \"YYYY-MM-DD\" 或 null, \"research_count\": int, "
+                    "\"summary\": \"一句話\", \"issues\": []}\n\n"
+                    "has_research_data: 是否有論文標題/摘要/DOI\n"
+                    f"is_updated_on_target_date: 日報日期是否為 {target_date}\n"
+                    "research_count: 文獻篇數\n"
+                    "summary: 繁體中文一句話\n"
+                    "issues: 問題列表"
                 ),
             },
             {
                 "role": "user",
-                "content": f"URL: {safe_url}\n\n---\n\n{content}",
+                "content": content,
             },
         ],
         "temperature": 0.1,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
+        "enable_thinking": False,
     }
 
     try:
