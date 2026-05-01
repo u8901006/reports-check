@@ -26,8 +26,10 @@ GLM_MODEL = os.environ.get("GLM_MODEL", "glm-4.7-flash")
 TZ = timezone(timedelta(hours=8))
 HISTORY_DIR = Path("history")
 REPORTS_JSON = Path("reports_status.json")
-API_DELAY = float(os.environ.get("API_DELAY", "5"))
-MAX_RETRIES = 3
+API_DELAY = float(os.environ.get("API_DELAY", "12"))
+MAX_RETRIES = 5
+BATCH_SIZE = 8
+BATCH_PAUSE = 60
 YESTERDAY = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
 YESTERDAY_SLUG = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -455,6 +457,9 @@ def main():
                  result.get("update_date"), result.get("yesterday_url"))
         if i < len(reports):
             time.sleep(API_DELAY)
+        if i % BATCH_SIZE == 0 and i < len(reports):
+            log.info("Batch pause: sleeping %ds after %d reports", BATCH_PAUSE, i)
+            time.sleep(BATCH_PAUSE)
 
     with open(REPORTS_JSON, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
