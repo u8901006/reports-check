@@ -20,14 +20,15 @@ HUB_URL = os.environ.get(
 )
 GLM_API_KEY = os.environ["GLM_API_KEY"]
 GLM_API_BASE = os.environ.get(
-    "GLM_API_BASE", "https://open.bigmodel.cn/api/paas/v4"
+    "GLM_API_BASE", "https://open.bigmodel.cn/api/coding/paas/v4"
 )
-GLM_MODEL = os.environ.get("GLM_MODEL", "glm-4.7-flash")
+FALLBACK_MODELS = ["glm-5-turbo", "glm-4.7", "glm-4.7-flash"]
+GLM_MODEL = os.environ.get("GLM_MODEL", "glm-5-turbo")
 TZ = timezone(timedelta(hours=8))
 HISTORY_DIR = Path("history")
 REPORTS_JSON = Path("reports_status.json")
-API_DELAY = float(os.environ.get("API_DELAY", "12"))
-MAX_RETRIES = 5
+API_DELAY = float(os.environ.get("API_DELAY", "8"))
+MAX_RETRIES = 3
 BATCH_SIZE = 8
 BATCH_PAUSE = 60
 YESTERDAY = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -79,46 +80,61 @@ def find_yesterday_report_url(index_url: str, index_html: str) -> str | None:
 
 
 def call_glm_api(payload: dict) -> dict:
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.post(
-                f"{GLM_API_BASE}/chat/completions",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {GLM_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                timeout=90,
-            )
-            if resp.status_code == 429:
-                wait = API_DELAY * (attempt + 2)
-                log.warning("Rate limited (429), waiting %.0fs before retry %d/%d", wait, attempt + 1, MAX_RETRIES)
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            finish_reason = data.get("choices", [{}])[0].get("finish_reason", "")
-            raw = data["choices"][0]["message"].get("content", "").strip()
-            if not raw or finish_reason == "length":
-                log.warning("Empty or truncated response (finish_reason=%s), retrying", finish_reason)
+    models_to_try = [payload.get("model", GLM_MODEL)]
+    for m in FALLBACK_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = None
+    for model in models_to_try:
+        current_payload = {**payload, "model": model}
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(
+                    f"{GLM_API_BASE}/chat/completions",
+                    json=current_payload,
+                    headers={
+                        "Authorization": f"Bearer {GLM_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=90,
+                )
+                if resp.status_code == 429:
+                    wait = API_DELAY * (attempt + 2)
+                    log.warning("Rate limited (429) on %s, waiting %.0fs (retry %d/%d)",
+                                model, wait, attempt + 1, MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                finish_reason = data.get("choices", [{}])[0].get("finish_reason", "")
+                raw = data["choices"][0]["message"].get("content", "").strip()
+                if not raw or finish_reason == "length":
+                    log.warning("Empty/truncated on %s (finish=%s), retrying", model, finish_reason)
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(API_DELAY * (attempt + 1))
+                    continue
+                raw = re.sub(r"^```json\s*|^```\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                result = json.loads(raw)
+                if model != models_to_try[0]:
+                    log.info("Succeeded with fallback model: %s", model)
+                return result
+            except (json.JSONDecodeError, KeyError) as e:
+                resp_text = resp.text[:200] if resp else "no response"
+                log.error("Parse error on %s attempt %d: %s — raw: %s", model, attempt + 1, e, resp_text)
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(API_DELAY * (attempt + 1))
+                last_error = e
                 continue
-            raw = re.sub(r"^```json\s*|^```\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
-        except (json.JSONDecodeError, KeyError) as e:
-            resp_text = resp.text[:200] if resp else "no response"
-            log.error("Parse error on attempt %d: %s — raw: %s", attempt + 1, e, resp_text)
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(API_DELAY * (attempt + 1))
-            continue
-        except requests.exceptions.RequestException as e:
-            log.error("Request error on attempt %d: %s", attempt + 1, e)
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(API_DELAY * (attempt + 1))
-            continue
-    raise RuntimeError(f"All {MAX_RETRIES} API attempts failed")
+            except requests.exceptions.RequestException as e:
+                log.error("Request error on %s attempt %d: %s", model, attempt + 1, e)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(API_DELAY * (attempt + 1))
+                last_error = e
+                continue
+        log.warning("Model %s exhausted all retries, trying next fallback", model)
+    raise RuntimeError(f"All models failed. Last error: {last_error}")
 
 
 def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> dict:
@@ -437,7 +453,7 @@ footer {{ text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.75r
   </table>
 </div>
 
-<footer>Reports Check Monitor · GitHub Actions · GLM-4.7-Flash · 檢查前一天日報狀態</footer>
+<footer>Reports Check Monitor · GitHub Actions · GLM-5-Turbo (fallback: GLM-4.7 → GLM-4.7-Flash) · Zhipu Coding Plan</footer>
 </body>
 </html>"""
 
