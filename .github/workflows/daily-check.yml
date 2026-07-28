@@ -34,9 +34,9 @@ jobs:
 
       - run: python monitor.py
         env:
-          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
-          GLM_API_BASE: ${{ vars.GLM_API_BASE }}
-          GLM_MODEL: ${{ vars.GLM_MODEL }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_BASE: https://integrate.api.nvidia.com/v1
+          NVIDIA_MODEL: nvidia/nemotron-3-super-120b-a12b
           HUB_URL: ${{ vars.HUB_URL }}
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0

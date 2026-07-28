@@ -18,12 +18,14 @@ HUB_URL = os.environ.get(
     "HUB_URL",
     "https://www.leepsyclinic.com/2026/04/psychiatric-researchs-AI-report.html",
 )
-GLM_API_KEY = os.environ["GLM_API_KEY"]
-GLM_API_BASE = os.environ.get(
-    "GLM_API_BASE", "https://open.bigmodel.cn/api/coding/paas/v4"
+NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
+NVIDIA_API_BASE = os.environ.get(
+    "NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1"
 )
-FALLBACK_MODELS = ["glm-5-turbo", "glm-4.7", "glm-4.7-flash"]
-GLM_MODEL = os.environ.get("GLM_MODEL", "glm-5-turbo")
+NVIDIA_MODEL = os.environ.get(
+    "NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"
+)
+FALLBACK_MODELS = ["nvidia/nemotron-3-nano-30b-a3b"]
 TZ = timezone(timedelta(hours=8))
 HISTORY_DIR = Path("history")
 REPORTS_JSON = Path("reports_status.json")
@@ -79,8 +81,8 @@ def find_yesterday_report_url(index_url: str, index_html: str) -> str | None:
     return None
 
 
-def call_glm_api(payload: dict) -> dict:
-    models_to_try = [payload.get("model", GLM_MODEL)]
+def call_nvidia_api(payload: dict) -> dict:
+    models_to_try = [payload.get("model", NVIDIA_MODEL)]
     for m in FALLBACK_MODELS:
         if m not in models_to_try:
             models_to_try.append(m)
@@ -91,10 +93,10 @@ def call_glm_api(payload: dict) -> dict:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = requests.post(
-                    f"{GLM_API_BASE}/chat/completions",
+                    f"{NVIDIA_API_BASE}/chat/completions",
                     json=current_payload,
                     headers={
-                        "Authorization": f"Bearer {GLM_API_KEY}",
+                        "Authorization": f"Bearer {NVIDIA_API_KEY}",
                         "Content-Type": "application/json",
                     },
                     timeout=90,
@@ -144,7 +146,7 @@ def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> d
     safe_url = report_url[:200]
 
     payload = {
-        "model": GLM_MODEL,
+        "model": NVIDIA_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -167,13 +169,15 @@ def analyze_report_with_ai(report_url: str, content: str, target_date: str) -> d
                 "content": content,
             },
         ],
-        "temperature": 0.1,
+        "temperature": 1.0,
+        "top_p": 0.95,
         "max_tokens": 4096,
-        "enable_thinking": False,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     try:
-        return call_glm_api(payload)
+        return call_nvidia_api(payload)
     except Exception as e:
         log.error("AI analysis failed for %s: %s", report_url, e)
         return {
@@ -453,7 +457,7 @@ footer {{ text-align: center; margin-top: 2rem; color: #64748b; font-size: 0.75r
   </table>
 </div>
 
-<footer>Reports Check Monitor · GitHub Actions · GLM-5-Turbo (fallback: GLM-4.7 → GLM-4.7-Flash) · Zhipu Coding Plan</footer>
+<footer>Reports Check Monitor · GitHub Actions · NVIDIA Nemotron 3 Super (fallback: Nemotron 3 Nano)</footer>
 </body>
 </html>"""
 
